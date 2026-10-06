@@ -141,11 +141,12 @@ class RuleEngine:
     ALIASES = {
         "stations": "station", "assets": "asset", "links": "link", "telemetries": "telemetry",
         "incidents": "incident", "recovery_actions": "recovery_action", "missions": "mission",
-        "gaps": "gap",
+        "gaps": "gap", "replacement_orders": "replacement_order",
     }
     INITIAL_STATUS = {
         "station": "online", "asset": "healthy", "link": "up", "telemetry": "current",
         "incident": "open", "recovery_action": "proposed", "mission": "planned", "gap": "open",
+        "replacement_order": "pending_handover",
     }
     TRANSITIONS = {
         "station": {
@@ -198,6 +199,10 @@ class RuleEngine:
             "fill": (("estimated",), "filled"),
             "accept": (("filled", "open"), "accepted"),
         },
+        "replacement_order": {
+            "resume": (("pending_handover",), "completed"),
+            "void": (("pending_handover",), "void"),
+        },
     }
     CREATE_REQUIRED = {
         "station": ("name", "region"),
@@ -208,6 +213,7 @@ class RuleEngine:
         "recovery_action": ("incident_id", "action_type", "dedupe_key"),
         "mission": ("station_id", "purpose", "window_start", "window_end"),
         "gap": ("incident_id", "start_at", "end_at"),
+        "replacement_order": ("old_asset_id", "new_asset_id", "effective_at"),
     }
     ACTION_REQUIRED = {
         ("station", "degrade"): ("reason",),
@@ -227,6 +233,7 @@ class RuleEngine:
         "recovery_action": ("admin", "operator", "engineer"),
         "mission": ("admin", "engineer"),
         "gap": ("admin", "operator", "engineer"),
+        "replacement_order": ("admin", "engineer"),
     }
     ROLE_ACTIONS = {
         "degrade": ("admin", "engineer", "operator"),
@@ -255,6 +262,8 @@ class RuleEngine:
         "estimate": ("admin", "engineer", "operator"),
         "fill": ("admin", "engineer", "operator"),
         "accept": ("admin", "engineer", "operator"),
+        ("replacement_order", "resume"): ("admin", "engineer", "operator"),
+        ("replacement_order", "void"): ("admin", "engineer"),
     }
     CUSTOM_CREATE = {
         "asset": lambda a, d, l: _validate_asset(d, l),

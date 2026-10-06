@@ -54,6 +54,9 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_replacement_order_active_asset
+                    ON entities(json_extract(data, '$.old_asset_id'))
+                    WHERE kind = 'replacement_order' AND status != 'void';
             """)
 
     @staticmethod
@@ -72,13 +75,43 @@ class SQLiteRepository:
     def create_entity(self, entity_id, kind, status, data, actor_id):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
-                (entity_id, kind, status, payload, actor_id, now, now),
-            )
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                    (entity_id, kind, status, payload, actor_id, now, now),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("duplicate or conflicting entity: " + str(exc))
         return self.get_entity(entity_id)
+
+    def reassign_asset(self, kind, from_asset_id, to_asset_id, exclude_statuses=None):
+        """Move all entities of ``kind`` pointing at ``from_asset_id`` to ``to_asset_id``.
+
+        Returns the ids that were moved. The UPDATE only matches rows still
+        pointing at the old asset, so calling it repeatedly is idempotent.
+        """
+        now = utcnow()
+        where = "kind = ? AND json_extract(data, '$.asset_id') = ?"
+        params = [kind, from_asset_id]
+        if exclude_statuses:
+            placeholders = ",".join("?" for _ in exclude_statuses)
+            where += " AND status NOT IN (" + placeholders + ")"
+            params.extend(exclude_statuses)
+        with self._connect() as connection:
+            rows = connection.execute("SELECT id FROM entities WHERE " + where, params).fetchall()
+            ids = [row["id"] for row in rows]
+            if not ids:
+                return []
+            id_placeholders = ",".join("?" for _ in ids)
+            connection.execute(
+                "UPDATE entities SET data = json_set(data, '$.asset_id', ?), "
+                "version = version + 1, updated_at = ? "
+                "WHERE id IN (" + id_placeholders + ")",
+                [to_asset_id, now] + ids,
+            )
+        return ids
 
     def get_entity(self, entity_id):
         with self._connect() as connection:
