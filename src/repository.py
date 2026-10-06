@@ -80,6 +80,58 @@ class SQLiteRepository:
             )
         return self.get_entity(entity_id)
 
+    def create_replacement_order(self, entity_id, status, data, actor_id):
+        """Insert a replacement order while atomically claiming its assets.
+
+        Non-voided orders keep directional claims: an asset already swapped out
+        (old_asset_id) cannot be swapped out again or reused as a replacement,
+        and an asset already swapped in (new_asset_id) cannot be a replacement
+        twice. The first writer wins; the loser learns the current owner.
+        """
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT * FROM entities WHERE kind = 'replacement' AND status != 'voided'"
+            ).fetchall()
+            old_claims = {}
+            new_claims = {}
+            for row in rows:
+                existing = self._entity_from_row(row)
+                if existing["data"].get("old_asset_id"):
+                    old_claims.setdefault(existing["data"]["old_asset_id"], existing)
+                if existing["data"].get("new_asset_id"):
+                    new_claims.setdefault(existing["data"]["new_asset_id"], existing)
+            old_asset_id = data.get("old_asset_id")
+            new_asset_id = data.get("new_asset_id")
+            conflict_asset = None
+            owner = None
+            if old_asset_id in old_claims:
+                conflict_asset, owner = old_asset_id, old_claims[old_asset_id]
+            elif new_asset_id in new_claims:
+                conflict_asset, owner = new_asset_id, new_claims[new_asset_id]
+            elif new_asset_id in old_claims:
+                conflict_asset, owner = new_asset_id, old_claims[new_asset_id]
+            if owner:
+                raise ConflictError(
+                    "asset %s already bound to replacement order %s (created_by %s)"
+                    % (conflict_asset, owner["id"], owner["created_by"])
+                )
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                (entity_id, "replacement", status, payload, actor_id, now, now),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(entity_id)
+
     def get_entity(self, entity_id):
         with self._connect() as connection:
             row = connection.execute(

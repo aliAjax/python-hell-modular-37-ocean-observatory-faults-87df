@@ -102,6 +102,19 @@ def _validate_gap(data, lookup):
         raise ValidationError("gap window is required")
 
 
+def _validate_replacement(data, lookup):
+    if data.get("old_asset_id") == data.get("new_asset_id"):
+        raise ValidationError("old_asset_id and new_asset_id must differ")
+    old_asset = _find_one(lookup, "asset", "id", data.get("old_asset_id"))
+    if not old_asset:
+        raise ValidationError("replacement requires an existing old asset")
+    new_asset = _find_one(lookup, "asset", "id", data.get("new_asset_id"))
+    if not new_asset:
+        raise ValidationError("replacement requires an existing new asset")
+    if old_asset["data"].get("station_id") != new_asset["data"].get("station_id"):
+        raise ValidationError("replacement assets must belong to the same station")
+
+
 def _revise_telemetry(actor, entity, data, lookup):
     try:
         new_revision = int(data.get("revision"))
@@ -141,11 +154,12 @@ class RuleEngine:
     ALIASES = {
         "stations": "station", "assets": "asset", "links": "link", "telemetries": "telemetry",
         "incidents": "incident", "recovery_actions": "recovery_action", "missions": "mission",
-        "gaps": "gap",
+        "gaps": "gap", "replacements": "replacement",
     }
     INITIAL_STATUS = {
         "station": "online", "asset": "healthy", "link": "up", "telemetry": "current",
         "incident": "open", "recovery_action": "proposed", "mission": "planned", "gap": "open",
+        "replacement": "pending_handover",
     }
     TRANSITIONS = {
         "station": {
@@ -198,6 +212,9 @@ class RuleEngine:
             "fill": (("estimated",), "filled"),
             "accept": (("filled", "open"), "accepted"),
         },
+        "replacement": {
+            "void": (("pending_handover",), "voided"),
+        },
     }
     CREATE_REQUIRED = {
         "station": ("name", "region"),
@@ -208,6 +225,7 @@ class RuleEngine:
         "recovery_action": ("incident_id", "action_type", "dedupe_key"),
         "mission": ("station_id", "purpose", "window_start", "window_end"),
         "gap": ("incident_id", "start_at", "end_at"),
+        "replacement": ("old_asset_id", "new_asset_id", "effective_at"),
     }
     ACTION_REQUIRED = {
         ("station", "degrade"): ("reason",),
@@ -227,6 +245,7 @@ class RuleEngine:
         "recovery_action": ("admin", "operator", "engineer"),
         "mission": ("admin", "engineer"),
         "gap": ("admin", "operator", "engineer"),
+        "replacement": ("admin", "engineer"),
     }
     ROLE_ACTIONS = {
         "degrade": ("admin", "engineer", "operator"),
@@ -255,6 +274,8 @@ class RuleEngine:
         "estimate": ("admin", "engineer", "operator"),
         "fill": ("admin", "engineer", "operator"),
         "accept": ("admin", "engineer", "operator"),
+        ("replacement", "execute"): ("admin", "engineer"),
+        ("replacement", "void"): ("admin", "engineer"),
     }
     CUSTOM_CREATE = {
         "asset": lambda a, d, l: _validate_asset(d, l),
@@ -264,6 +285,7 @@ class RuleEngine:
         "recovery_action": lambda a, d, l: _validate_action(d, l),
         "mission": lambda a, d, l: _validate_mission(d, l),
         "gap": lambda a, d, l: _validate_gap(d, l),
+        "replacement": lambda a, d, l: _validate_replacement(d, l),
     }
     CUSTOM_TRANSITIONS = {
         ("telemetry", "revise"): _revise_telemetry,
@@ -292,6 +314,10 @@ class RuleEngine:
             custom(actor, data, lookup)
         return dict(data)
 
+    def ensure_action_role(self, actor, kind, action):
+        allowed = self.ROLE_ACTIONS.get((kind, action), self.ROLE_ACTIONS.get(action, ("admin",)))
+        _ensure_role(actor, allowed)
+
     def validate_transition(self, actor, entity, action, data, lookup=None):
         kind = self.normalize_kind(entity["kind"])
         transition = self.TRANSITIONS.get(kind, {}).get(action)
@@ -300,8 +326,7 @@ class RuleEngine:
         allowed_statuses, next_status = transition
         if entity["status"] not in allowed_statuses:
             raise InvalidTransition("cannot %s from status %s" % (action, entity["status"]))
-        allowed = self.ROLE_ACTIONS.get((kind, action), self.ROLE_ACTIONS.get(action, ("admin",)))
-        _ensure_role(actor, allowed)
+        self.ensure_action_role(actor, kind, action)
         _require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = self.CUSTOM_TRANSITIONS.get((kind, action))
         extra = custom(actor, entity, data, lookup) if custom else {}
